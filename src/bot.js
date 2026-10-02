@@ -53,7 +53,7 @@ bot.on('text', async (ctx) => {
   try {
     r = await calculateMeal(meal, preguntas, respuestas, at.toLocaleString('es-CR'));
     const notas = meal.image ? 'Foto enviada por bot' : 'Texto enviado por bot';
-    await appendMeal([at.toLocaleDateString('en-CA'), r.tipo, r.descripcion, r.calorias, `${r.proteina}g`, notas]);
+    await appendMeal([at.toLocaleDateString('en-CA'), r.tipo, r.descripcion, r.calorias, r.proteina, notas]);
   } catch (err) {
     respuestas.pop(); // nothing was saved: let the user resend the last answer to retry
     throw err;
