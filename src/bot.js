@@ -51,7 +51,7 @@ bot.on('text', async (ctx) => {
   const { meal, at } = session;
   let r;
   try {
-    r = await calculateMeal(meal, preguntas, respuestas, at.toLocaleString('es-AR'));
+    r = await calculateMeal(meal, preguntas, respuestas, at.toLocaleString('es-CR'));
     const notas = meal.image ? 'Foto enviada por bot' : 'Texto enviado por bot';
     await appendMeal([at.toLocaleDateString('en-CA'), r.tipo, r.descripcion, r.calorias, `${r.proteina}g`, notas]);
   } catch (err) {
@@ -65,14 +65,19 @@ bot.on('text', async (ctx) => {
 async function startMeal(ctx, meal) {
   const at = new Date(); // when the meal was sent, not when the last answer arrives
   await ctx.sendChatAction('typing');
-  const { descripcion, preguntas } = await analyzeMeal(meal);
+  // analyzeMeal needs the hour now too, so it can ask about meal type when the hour is
+  // ambiguous (claude.js) instead of calculateMeal() guessing it later unasked.
+  const { descripcion, preguntas } = await analyzeMeal(meal, at.toLocaleString('es-CR'));
   const session = { meal, at, preguntas, respuestas: [] };
   sessions.set(ctx.chat.id, session);
-  await ctx.reply(`🍽️ ${descripcion}\n\nTe hago 3 preguntas para afinar el cálculo (/cancelar para salir).`);
+  // preguntas.length is now 1-3 (analyzeMeal/claude.js tailors question count to the meal),
+  // so both the intro line and the "n/total" counter below must read it instead of saying "3".
+  const n = preguntas.length;
+  await ctx.reply(`🍽️ ${descripcion}\n\nTe hago ${n} pregunta${n > 1 ? 's' : ''} para afinar el cálculo (/cancelar para salir).`);
   await ctx.reply(question(session));
 }
 
-const question = ({ preguntas, respuestas }) => `${respuestas.length + 1}/3: ${preguntas[respuestas.length]}`;
+const question = ({ preguntas, respuestas }) => `${respuestas.length + 1}/${preguntas.length}: ${preguntas[respuestas.length]}`;
 
 bot.launch();
 process.once('SIGINT', () => bot.stop('SIGINT'));

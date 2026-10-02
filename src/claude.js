@@ -14,11 +14,14 @@ const object = (properties) => ({
   additionalProperties: false,
 });
 
+// Was 3 fixed fields (porciones/coccion/extras) asked for every meal, even simple ones
+// where most don't apply. Now Claude picks 1-3 questions based on what the meal actually
+// needs. `preguntas` feeds bot.js's session loop (session.preguntas.length drives the
+// "n/total" counter and when calculateMeal() gets called), so its length must match however
+// many questions Claude actually asked.
 const QUESTIONS = object({
   descripcion: str,
-  pregunta_porciones: str,
-  pregunta_coccion: str,
-  pregunta_extras: str,
+  preguntas: { type: 'array', items: str },
 });
 
 const RESULT = object({
@@ -51,19 +54,26 @@ function mealContent({ image, text }) {
   ];
 }
 
-export async function analyzeMeal(meal) {
+export async function analyzeMeal(meal, now) {
+  // `now` lets Claude notice when the meal type (desayuno/almuerzo/merienda/cena/snack) is
+  // ambiguous from the hour alone (e.g. 11:30am) and ask about it as one of the up-to-3
+  // questions, instead of calculateMeal() silently guessing it later with no user input.
   const r = await ask(
     [
       ...mealContent(meal),
       {
         type: 'text',
-        text: `Describí brevemente lo que ves y hacé exactamente 3 preguntas específicas a esta comida que más reduzcan la incertidumbre del cálculo:
-1) porciones/cantidades, 2) método de cocción (aceite, manteca, frito, horno...), 3) ingredientes extras no visibles (salsas, aderezos, azúcar, bebida...).`,
+        text: `Hora local: ${now}. Describí brevemente lo que ves. Clasificá la comida y hacé entre 1 y 3 preguntas (nunca más de 3), solo las necesarias para reducir la incertidumbre del cálculo:
+- Mezcla simple sin cocción (ej. avena + manteca de maní + miel): una pregunta confirmando cantidades/proporciones.
+- Proteína cocinada (ej. pollo, carne): peso aproximado, método de cocción (frito, plancha, horno) y si llevó aceite/manteca.
+- Múltiples componentes (ej. arroz + carne + verduras): porciones y preparación de cada componente.
+- Si la hora no deja claro si es desayuno, almuerzo, merienda, cena o snack, sumá una pregunta para confirmarlo.
+No preguntes algo que ya es evidente en la foto o la descripción.`,
       },
     ],
     QUESTIONS,
   );
-  return { descripcion: r.descripcion, preguntas: [r.pregunta_porciones, r.pregunta_coccion, r.pregunta_extras] };
+  return { descripcion: r.descripcion, preguntas: r.preguntas };
 }
 
 export async function calculateMeal(meal, preguntas, respuestas, now) {
@@ -76,7 +86,7 @@ export async function calculateMeal(meal, preguntas, respuestas, now) {
         text: `${qa}
 
 Hora local: ${now}. Con estas respuestas calculá los totales.
-- tipo: según la hora y la comida.
+- tipo: si alguna respuesta confirma el tipo de comida, usá esa; si no, inferilo de la hora y la comida.
 - descripcion: corta, con cantidades (ej. "3 huevos fritos con pan").
 - calorias: kcal totales; proteina: gramos totales (enteros).
 - detalle: desglose breve por ingrediente para mostrarle al usuario.`,
