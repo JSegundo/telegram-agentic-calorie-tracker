@@ -8,18 +8,40 @@ const allowed = new Set(process.env.ALLOWED_USER_IDS.split(',').map((id) => id.t
 // Claude calls can take a while; don't let Telegraf time the handler out mid-meal.
 const bot = new Telegraf(process.env.TELEGRAM_BOT_TOKEN, { handlerTimeout: Infinity });
 
-// chatId -> { meal, at, preguntas, respuestas }
+const log = (...args) => console.log(new Date().toISOString(), ...args);
+
+// weekday + ISO date + time: claude.js needs an unambiguous "today" to resolve "ayer"/"el lunes pasado".
+const localNow = (at) => `${at.toLocaleDateString('es-CR', { weekday: 'long' })} ${at.toLocaleDateString('en-CA')} ${at.toLocaleTimeString('es-CR')}`;
+
+// chatId -> { meal, at, preguntas, respuestas, lastActivity }
 const sessions = new Map();
+
+// sweeps sessions idle past SESSION_TIMEOUT_MS — otherwise an abandoned meal (unanswered
+// questions) leaks forever. lastActivity tracks idle time; `at` stays the original send
+// time since claude.js uses it as "today" for date math.
+const SESSION_TIMEOUT_MS = 15 * 60 * 1000;
+setInterval(() => {
+  const cutoff = Date.now() - SESSION_TIMEOUT_MS;
+  for (const [id, session] of sessions) {
+    if (session.lastActivity < cutoff) {
+      log(`session expired: chat=${id}`);
+      sessions.delete(id);
+    }
+  }
+}, 60 * 1000);
 
 // Telegraf handles updates of the same batch concurrently. Chain each chat's updates
 // so a session is never read/mutated by two handlers at once (e.g. an answer sent mid-analysis).
 const queues = new Map();
 bot.use((ctx, next) => {
-  if (!allowed.has(String(ctx.from?.id))) return;
+  const kind = ctx.updateType === 'message' ? Object.keys(ctx.message).find((k) => k !== 'message_id' && k !== 'date' && k !== 'chat' && k !== 'from') : ctx.updateType;
+  log(`update kind=${kind} from=${ctx.from?.id} chat=${ctx.chat?.id}`);
+  if (!allowed.has(String(ctx.from?.id))) return log(`blocked: from=${ctx.from?.id} not in ALLOWED_USER_IDS`);
   const id = ctx.chat.id;
   const run = (queues.get(id) ?? Promise.resolve()).then(next).catch((err) => {
-    console.error(err);
-    return ctx.reply('⚠️ Algo falló. Probá de nuevo.').catch(() => {});
+    log('error:', err);
+    // err.userMessage (set at specific throw sites) gives a step-specific message; falls back to the generic one otherwise
+    return ctx.reply(err.userMessage ?? '⚠️ Algo falló. Probá de nuevo.').catch(() => {});
   });
   queues.set(id, run);
   return run.finally(() => queues.get(id) === run && queues.delete(id));
@@ -34,8 +56,17 @@ bot.command('cancelar', (ctx) => {
 
 bot.on('photo', async (ctx) => {
   const { file_id } = ctx.message.photo.at(-1); // largest size
+  log(`photo: chat=${ctx.chat.id} downloading file_id=${file_id}`);
   const link = await ctx.telegram.getFileLink(file_id);
-  const { data } = await axios.get(link.href, { responseType: 'arraybuffer' });
+  let data;
+  try {
+    data = (await axios.get(link.href, { responseType: 'arraybuffer' })).data;
+  } catch (err) {
+    // tagged separately so a download failure doesn't look like an analysis/save failure
+    err.userMessage = '⚠️ No pude descargar la foto de Telegram. Probá de nuevo.';
+    throw err;
+  }
+  log(`photo: chat=${ctx.chat.id} downloaded ${data.byteLength} bytes`);
   await startMeal(ctx, { image: Buffer.from(data).toString('base64'), text: ctx.message.caption });
 });
 
@@ -44,35 +75,56 @@ bot.on('text', async (ctx) => {
   if (!session) return startMeal(ctx, { text: ctx.message.text });
 
   session.respuestas.push(ctx.message.text);
+  session.lastActivity = Date.now(); // keeps the session alive for the expiry sweep above
   const { preguntas, respuestas } = session;
   if (respuestas.length < preguntas.length) return ctx.reply(question(session));
 
+  await finishMeal(ctx, session);
+});
+
+// shared by bot.on('text') and startMeal() (when preguntas=[] skips straight here)
+async function finishMeal(ctx, { meal, at, preguntas, respuestas }) {
   await ctx.sendChatAction('typing');
-  const { meal, at } = session;
   let r;
+  log(`calculateMeal: chat=${ctx.chat.id} start`);
   try {
-    r = await calculateMeal(meal, preguntas, respuestas, at.toLocaleString('es-CR'));
-    const notas = meal.image ? 'Foto enviada por bot' : 'Texto enviado por bot';
-    await appendMeal([at.toLocaleDateString('en-CA'), r.tipo, r.descripcion, r.calorias, r.proteina, notas]);
+    r = await calculateMeal(meal, preguntas, respuestas, localNow(at));
   } catch (err) {
-    respuestas.pop(); // nothing was saved: let the user resend the last answer to retry
+    respuestas.pop(); // nothing was saved: let the user resend the last answer to retry (no-op if there wasn't one)
+    throw err;
+  }
+  log(`calculateMeal: chat=${ctx.chat.id} done valido=${r.valido}`);
+  // r.valido: nonsense answer rejected here (restarts) instead of writing a bogus row
+  if (!r.valido) {
+    sessions.delete(ctx.chat.id);
+    return ctx.reply(r.descripcion);
+  }
+  try {
+    const notas = meal.image ? 'Foto enviada por bot' : 'Texto enviado por bot';
+    // r.fecha (not at): lets "lo comí ayer" land on the right day instead of the send date
+    await appendMeal([r.fecha, r.tipo, r.descripcion, r.calorias, r.proteina, notas]); // number, not "Ng", so the sheet can SUM() it
+    log(`appendMeal: chat=${ctx.chat.id} saved`);
+  } catch (err) {
+    // tagged separately: totals computed fine, only the Sheets write failed — session stays alive so the same answer can retry
+    respuestas.pop();
+    err.userMessage = '⚠️ Se calculó pero no se pudo guardar en la planilla. Probá de nuevo.';
     throw err;
   }
   sessions.delete(ctx.chat.id);
   await ctx.reply(`✅ Guardado: ${r.tipo} — ${r.descripcion}\n🔥 ${r.calorias} kcal · 💪 ${r.proteina}g proteína\n\n${r.detalle}`);
-});
+}
 
 async function startMeal(ctx, meal) {
   const at = new Date(); // when the meal was sent, not when the last answer arrives
   await ctx.sendChatAction('typing');
-  // analyzeMeal needs the hour now too, so it can ask about meal type when the hour is
-  // ambiguous (claude.js) instead of calculateMeal() guessing it later unasked.
-  const { descripcion, preguntas } = await analyzeMeal(meal, at.toLocaleString('es-CR'));
-  const session = { meal, at, preguntas, respuestas: [] };
+  log(`analyzeMeal: chat=${ctx.chat.id} start`);
+  const { descripcion, preguntas, valido } = await analyzeMeal(meal, localNow(at));
+  log(`analyzeMeal: chat=${ctx.chat.id} done valido=${valido}`);
+  if (!valido) return ctx.reply(descripcion); // junk input, nothing to ask
+  if (preguntas.length === 0) return finishMeal(ctx, { meal, at, preguntas, respuestas: [] }); // standard meal, skip straight to finishMeal
+  const session = { meal, at, preguntas, respuestas: [], lastActivity: Date.now() };
   sessions.set(ctx.chat.id, session);
-  // preguntas.length is now 1-3 (analyzeMeal/claude.js tailors question count to the meal),
-  // so both the intro line and the "n/total" counter below must read it instead of saying "3".
-  const n = preguntas.length;
+  const n = preguntas.length; // 0-3 now, not always 3
   await ctx.reply(`🍽️ ${descripcion}\n\nTe hago ${n} pregunta${n > 1 ? 's' : ''} para afinar el cálculo (/cancelar para salir).`);
   await ctx.reply(question(session));
 }
