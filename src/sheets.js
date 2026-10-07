@@ -32,3 +32,15 @@ export async function getRecentMeals(tipo, limit = 8) {
     .slice(-limit)
     .map(([fecha, , descripcion, calorias, proteina]) => ({ fecha, descripcion, calorias, proteina }));
 }
+
+// backs claude.js's consultar_historial; desde/hasta are YYYY-MM-DD, inclusive — string
+// comparison works since appendMeal always writes ISO dates.
+export async function getMealsInRange(desde, hasta) {
+  const { data } = await sheets.spreadsheets.values.get({
+    spreadsheetId: process.env.SPREADSHEET_ID,
+    range: `'${process.env.SHEET_NAME}'!A:F`,
+  });
+  return (data.values ?? [])
+    .filter(([fecha]) => fecha >= desde && fecha <= hasta)
+    .map(([fecha, tipo, descripcion, calorias, proteina]) => ({ fecha, tipo, descripcion, calorias: Number(calorias), proteina: Number(proteina) }));
+}

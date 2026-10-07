@@ -2,9 +2,6 @@
 
 ## Quick wins
 
-- **`/hoy` and `/semana`** — read back from the sheet, sum calories/protein for
-  today/this week, reply with totals. Right now the only way to see a running
-  total is opening the spreadsheet.
 - **`/deshacer`** — delete the last appended row. A bad entry currently has no
   fix except editing the sheet by hand.
 - **Daily goal + remaining count** — store a calorie/protein target, include

@@ -118,8 +118,9 @@ async function startMeal(ctx, meal) {
   const at = new Date(); // when the meal was sent, not when the last answer arrives
   await ctx.sendChatAction('typing');
   log(`analyzeMeal: chat=${ctx.chat.id} start`);
-  const { descripcion, preguntas, valido } = await analyzeMeal(meal, localNow(at));
-  log(`analyzeMeal: chat=${ctx.chat.id} done valido=${valido}`);
+  const { descripcion, preguntas, valido, esConsulta } = await analyzeMeal(meal, localNow(at));
+  log(`analyzeMeal: chat=${ctx.chat.id} done valido=${valido} esConsulta=${esConsulta}`);
+  if (esConsulta) return ctx.reply(descripcion); // history query ("cómo estuvo ayer"), already answered — nothing to log
   if (!valido) return ctx.reply(descripcion); // junk input, nothing to ask
   if (preguntas.length === 0) return finishMeal(ctx, { meal, at, preguntas, respuestas: [] }); // standard meal, skip straight to finishMeal
   const session = { meal, at, preguntas, respuestas: [], lastActivity: Date.now() };

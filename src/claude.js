@@ -1,5 +1,5 @@
 import Anthropic from '@anthropic-ai/sdk';
-import { getRecentMeals } from './sheets.js';
+import { getRecentMeals, getMealsInRange } from './sheets.js';
 
 const client = new Anthropic();
 
@@ -17,8 +17,10 @@ const object = (properties) => ({
 
 // preguntas: 0-3 contextual questions (bot.js reads .length for the "n/total" counter).
 // valido=false: non-food input, descripcion holds the rejection message, preguntas=[].
+// es_consulta=true: history query, descripcion holds the narrated answer; valido/preguntas are unused filler then.
 const QUESTIONS = object({
   valido: { type: 'boolean' },
+  es_consulta: { type: 'boolean' },
   descripcion: str,
   preguntas: { type: 'array', items: str },
 });
@@ -73,14 +75,22 @@ async function ask(content, schema, { tools, runTool } = {}) {
 
 // Only called when the user explicitly says "lo de siempre"/equivalent — the description
 // below is the actual trigger rule Claude reads.
-const TOOLS = [{
-  name: 'buscar_comida_habitual',
-  description: 'Busca las últimas comidas registradas de un tipo para ver qué cantidades se usaron habitualmente. Llamar SOLO si el usuario dice explícitamente algo como "lo de siempre", "como siempre", "igual que ayer/el otro día" o "lo habitual" — una referencia explícita a repetir una comida anterior. NO llamar para una comida nueva sin esa referencia explícita, y no llamar más de una vez por mensaje.',
-  input_schema: object({ tipo: { type: 'string', enum: ['Desayuno', 'Almuerzo', 'Merienda', 'Cena', 'Snack'] } }),
-}];
+const TOOLS = [
+  {
+    name: 'buscar_comida_habitual',
+    description: 'Busca las últimas comidas registradas de un tipo para ver qué cantidades se usaron habitualmente. Llamar SOLO si el usuario dice explícitamente algo como "lo de siempre", "como siempre", "igual que ayer/el otro día" o "lo habitual" — una referencia explícita a repetir una comida anterior. NO llamar para una comida nueva sin esa referencia explícita, y no llamar más de una vez por mensaje.',
+    input_schema: object({ tipo: { type: 'string', enum: ['Desayuno', 'Almuerzo', 'Merienda', 'Cena', 'Snack'] } }),
+  },
+  {
+    name: 'consultar_historial',
+    description: 'Busca las comidas registradas entre dos fechas (inclusive) para responder preguntas sobre el historial, ej. "cómo estuvo ayer", "qué comí la semana pasada", "cuánta proteína llevo esta semana". Llamar cuando el texto es una pregunta sobre comidas pasadas, no una comida nueva para registrar. desde/hasta en formato YYYY-MM-DD, resueltos a partir de la Hora local (ej. "ayer" = ese único día; "la semana pasada" = lunes a domingo anterior).',
+    input_schema: object({ desde: { type: 'string', format: 'date' }, hasta: { type: 'string', format: 'date' } }),
+  },
+];
 
 async function runTool(name, input) {
   if (name === 'buscar_comida_habitual') return getRecentMeals(input.tipo);
+  if (name === 'consultar_historial') return getMealsInRange(input.desde, input.hasta);
   throw new Error(`unknown tool ${name}`);
 }
 
@@ -98,8 +108,9 @@ export async function analyzeMeal(meal, now) {
       ...mealContent(meal),
       {
         type: 'text',
-        text: `Hora local: ${now}. Si la foto o el texto NO corresponden a una comida real (objeto random, texto sin sentido, spam, etc.), poné valido=false, preguntas=[] y descripcion con una frase breve explicando por qué no se puede procesar.
-Si sí es comida, poné valido=true, describí brevemente lo que ves, clasificá la comida y hacé hasta 3 preguntas (0 a 3), solo las necesarias para reducir la incertidumbre del cálculo:
+        text: `Hora local: ${now}. Si el texto es una pregunta sobre el historial de comidas (ej. "cómo estuvo ayer", "qué tal la semana pasada", "cuánta proteína llevo hoy") y no una comida nueva para registrar: poné es_consulta=true, valido=true, preguntas=[], usá consultar_historial con el rango de fechas correspondiente, y en descripcion escribí la respuesta completa en tono de nutricionista (breve, con los totales reales y algún comentario útil).
+Si la foto o el texto NO corresponden a una comida real ni a una consulta (objeto random, texto sin sentido, spam, etc.), poné es_consulta=false, valido=false, preguntas=[] y descripcion con una frase breve explicando por qué no se puede procesar.
+Si sí es comida nueva para registrar, poné es_consulta=false, valido=true, describí brevemente lo que ves, clasificá la comida y hacé hasta 3 preguntas (0 a 3), solo las necesarias para reducir la incertidumbre del cálculo:
 - Mezcla simple sin cocción (ej. avena + manteca de maní + miel): una pregunta confirmando cantidades/proporciones.
 - Proteína cocinada (ej. pollo, carne): peso aproximado, método de cocción (frito, plancha, horno) y si llevó aceite/manteca.
 - Múltiples componentes (ej. arroz + carne + verduras): porciones y preparación de cada componente.
@@ -112,7 +123,7 @@ Si el usuario pide "lo de siempre" o algo equivalente, usá buscar_comida_habitu
     QUESTIONS,
     { tools: TOOLS, runTool },
   );
-  return { descripcion: r.descripcion, preguntas: r.preguntas, valido: r.valido };
+  return { descripcion: r.descripcion, preguntas: r.preguntas, valido: r.valido, esConsulta: r.es_consulta };
 }
 
 export async function calculateMeal(meal, preguntas, respuestas, now) {
