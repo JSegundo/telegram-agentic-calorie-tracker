@@ -18,24 +18,36 @@ const object = (properties) => ({
 // preguntas: 0-3 contextual questions (bot.js reads .length for the "n/total" counter).
 // valido=false: non-food input, descripcion holds the rejection message, preguntas=[].
 // es_consulta=true: history query, descripcion holds the narrated answer; valido/preguntas are unused filler then.
+// es_multiple=true: text describes 2+ meals in one message (a day backfill) — preguntas is
+// still 0-3 but shared across all of them, not per meal; bot.js routes to calculateMeals().
 const QUESTIONS = object({
   valido: { type: 'boolean' },
   es_consulta: { type: 'boolean' },
+  es_multiple: { type: 'boolean' },
   descripcion: str,
   preguntas: { type: 'array', items: str },
 });
 
-// valido=false: nonsense/contradictory answer, descripcion holds the rejection message,
-// numeric fields are unused filler. fecha: resolved date (handles "lo comí ayer" etc.),
-// not just the message's send date.
-const RESULT = object({
-  valido: { type: 'boolean' },
+// Shared by RESULT (one meal) and BATCH_RESULT's `comidas` items (several meals from one
+// backfill message) — same per-meal fields either way.
+const MEAL_FIELDS = {
   fecha: { type: 'string', format: 'date' },
   tipo: { type: 'string', enum: ['Desayuno', 'Almuerzo', 'Merienda', 'Cena', 'Snack'] },
   descripcion: str,
   calorias: int,
   proteina: int,
   detalle: str,
+};
+
+// valido=false: nonsense/contradictory answer, descripcion holds the rejection message,
+// numeric fields are unused filler. fecha: resolved date (handles "lo comí ayer" etc.),
+// not just the message's send date.
+const RESULT = object({ valido: { type: 'boolean' }, ...MEAL_FIELDS });
+
+// valido=false: comidas=[] filler, same meaning as RESULT's valido=false.
+const BATCH_RESULT = object({
+  valido: { type: 'boolean' },
+  comidas: { type: 'array', items: object(MEAL_FIELDS) },
 });
 
 // tools/runTool only passed by analyzeMeal (buscar_comida_habitual); calculateMeal never loops here.
@@ -108,9 +120,10 @@ export async function analyzeMeal(meal, now) {
       ...mealContent(meal),
       {
         type: 'text',
-        text: `Hora local: ${now}. Si el texto es una pregunta sobre el historial de comidas (ej. "cómo estuvo ayer", "qué tal la semana pasada", "cuánta proteína llevo hoy") y no una comida nueva para registrar: poné es_consulta=true, valido=true, preguntas=[], usá consultar_historial con el rango de fechas correspondiente, y en descripcion escribí la respuesta completa en tono de nutricionista (breve, con los totales reales y algún comentario útil).
-Si la foto o el texto NO corresponden a una comida real ni a una consulta (objeto random, texto sin sentido, spam, etc.), poné es_consulta=false, valido=false, preguntas=[] y descripcion con una frase breve explicando por qué no se puede procesar.
-Si sí es comida nueva para registrar, poné es_consulta=false, valido=true, describí brevemente lo que ves, clasificá la comida y hacé hasta 3 preguntas (0 a 3), solo las necesarias para reducir la incertidumbre del cálculo:
+        text: `Hora local: ${now}. Si el texto es una pregunta sobre el historial de comidas (ej. "cómo estuvo ayer", "qué tal la semana pasada", "cuánta proteína llevo hoy") y no una comida nueva para registrar: poné es_consulta=true, valido=true, es_multiple=false, preguntas=[], usá consultar_historial con el rango de fechas correspondiente, y en descripcion escribí la respuesta completa en tono de nutricionista (breve, con los totales reales y algún comentario útil).
+Si el texto describe 2 o más comidas distintas en un mismo mensaje (ej. "ayer desayuné tostadas, almorcé pollo y cené ensalada", un repaso de todo un día): poné es_multiple=true, valido=true, es_consulta=false, descripcion con un resumen breve de las comidas que detectaste, y hacé hasta 3 preguntas EN TOTAL (0 a 3, no por comida) — solo las imprescindibles para calcular todas.
+Si la foto o el texto NO corresponden a una comida real ni a una consulta (objeto random, texto sin sentido, spam, etc.), poné es_consulta=false, es_multiple=false, valido=false, preguntas=[] y descripcion con una frase breve explicando por qué no se puede procesar.
+Si sí es una sola comida nueva para registrar, poné es_consulta=false, es_multiple=false, valido=true, describí brevemente lo que ves, clasificá la comida y hacé hasta 3 preguntas (0 a 3), solo las necesarias para reducir la incertidumbre del cálculo:
 - Mezcla simple sin cocción (ej. avena + manteca de maní + miel): una pregunta confirmando cantidades/proporciones.
 - Proteína cocinada (ej. pollo, carne): peso aproximado, método de cocción (frito, plancha, horno) y si llevó aceite/manteca.
 - Múltiples componentes (ej. arroz + carne + verduras): porciones y preparación de cada componente.
@@ -123,7 +136,30 @@ Si el usuario pide "lo de siempre" o algo equivalente, usá buscar_comida_habitu
     QUESTIONS,
     { tools: TOOLS, runTool },
   );
-  return { descripcion: r.descripcion, preguntas: r.preguntas, valido: r.valido, esConsulta: r.es_consulta };
+  return { descripcion: r.descripcion, preguntas: r.preguntas, valido: r.valido, esConsulta: r.es_consulta, esMultiple: r.es_multiple };
+}
+
+// Batch counterpart of calculateMeal: takes the original backfill text (not split up front —
+// Claude both re-identifies the individual meals and computes each one's totals here) plus
+// the up-to-3 shared answers, and returns one result per meal it finds.
+export async function calculateMeals(text, preguntas, respuestas, now) {
+  const qa = preguntas.map((q, i) => `P: ${q}\nR: ${respuestas[i]}`).join('\n\n');
+  return ask(
+    [
+      { type: 'text', text: `Comidas: ${text}` },
+      {
+        type: 'text',
+        text: `${qa}
+
+Hora local: ${now}. El texto describe varias comidas en un mismo mensaje, posiblemente de un día distinto a hoy (ej. "ayer"). Identificá cada comida por separado y calculá sus totales.
+Si alguna respuesta no tiene sentido, poné valido=false y comidas=[] (no se van a usar).
+Si tiene sentido (o no hay preguntas/respuestas), poné valido=true y para cada comida que identifiques:
+- fecha: la fecha real en que se comió, en formato YYYY-MM-DD, resuelta a partir de la Hora local y cualquier referencia temporal del texto (ej. "ayer"). Si varias comidas son del mismo día, repetí la misma fecha.
+- tipo, descripcion, calorias, proteina, detalle: igual que para una comida individual.`,
+      },
+    ],
+    BATCH_RESULT,
+  );
 }
 
 export async function calculateMeal(meal, preguntas, respuestas, now) {

@@ -1,7 +1,7 @@
 import 'dotenv/config';
 import axios from 'axios';
 import { Telegraf } from 'telegraf';
-import { analyzeMeal, calculateMeal } from './claude.js';
+import { analyzeMeal, calculateMeal, calculateMeals } from './claude.js';
 import { appendMeal } from './sheets.js';
 
 const allowed = new Set(process.env.ALLOWED_USER_IDS.split(',').map((id) => id.trim()));
@@ -79,7 +79,7 @@ bot.on('text', async (ctx) => {
   const { preguntas, respuestas } = session;
   if (respuestas.length < preguntas.length) return ctx.reply(question(session));
 
-  await finishMeal(ctx, session);
+  await (session.batch ? finishMeals : finishMeal)(ctx, session);
 });
 
 // shared by bot.on('text') and startMeal() (when preguntas=[] skips straight here)
@@ -114,18 +114,52 @@ async function finishMeal(ctx, { meal, at, preguntas, respuestas }) {
   await ctx.reply(`✅ Guardado: ${r.tipo} — ${r.descripcion}\n🔥 ${r.calorias} kcal · 💪 ${r.proteina}g proteína\n\n${r.detalle}`);
 }
 
+// Batch counterpart of finishMeal, for a day-backfill message ("ayer desayuné X, almorcé
+// Y, cené Z"). appendMeal runs in a loop here, so a failure partway through can re-save
+// rows that already succeeded on retry — acceptable for a personal single-user sheet.
+async function finishMeals(ctx, { meal, at, preguntas, respuestas }) {
+  await ctx.sendChatAction('typing');
+  let r;
+  log(`calculateMeals: chat=${ctx.chat.id} start`);
+  try {
+    r = await calculateMeals(meal.text, preguntas, respuestas, localNow(at));
+  } catch (err) {
+    respuestas.pop();
+    throw err;
+  }
+  log(`calculateMeals: chat=${ctx.chat.id} done valido=${r.valido} n=${r.comidas?.length}`);
+  if (!r.valido) {
+    sessions.delete(ctx.chat.id);
+    return ctx.reply('⚠️ No entendí bien alguna respuesta. Probá de nuevo.');
+  }
+  try {
+    for (const m of r.comidas) {
+      await appendMeal([m.fecha, m.tipo, m.descripcion, m.calorias, m.proteina, 'Cargado en lote por bot']);
+    }
+    log(`appendMeal: chat=${ctx.chat.id} saved batch of ${r.comidas.length}`);
+  } catch (err) {
+    respuestas.pop();
+    err.userMessage = '⚠️ Se calculó pero no se pudo guardar todo en la planilla. Probá de nuevo.';
+    throw err;
+  }
+  sessions.delete(ctx.chat.id);
+  const resumen = r.comidas.map((m) => `${m.tipo} (${m.fecha}): ${m.descripcion} — 🔥${m.calorias} kcal · 💪${m.proteina}g`).join('\n');
+  await ctx.reply(`✅ Guardadas ${r.comidas.length} comidas:\n${resumen}`);
+}
+
 async function startMeal(ctx, meal) {
   const at = new Date(); // when the meal was sent, not when the last answer arrives
   await ctx.sendChatAction('typing');
   log(`analyzeMeal: chat=${ctx.chat.id} start`);
-  const { descripcion, preguntas, valido, esConsulta } = await analyzeMeal(meal, localNow(at));
-  log(`analyzeMeal: chat=${ctx.chat.id} done valido=${valido} esConsulta=${esConsulta}`);
+  const { descripcion, preguntas, valido, esConsulta, esMultiple } = await analyzeMeal(meal, localNow(at));
+  log(`analyzeMeal: chat=${ctx.chat.id} done valido=${valido} esConsulta=${esConsulta} esMultiple=${esMultiple}`);
   if (esConsulta) return ctx.reply(descripcion); // history query ("cómo estuvo ayer"), already answered — nothing to log
   if (!valido) return ctx.reply(descripcion); // junk input, nothing to ask
-  if (preguntas.length === 0) return finishMeal(ctx, { meal, at, preguntas, respuestas: [] }); // standard meal, skip straight to finishMeal
-  const session = { meal, at, preguntas, respuestas: [], lastActivity: Date.now() };
+  const finish = esMultiple ? finishMeals : finishMeal;
+  if (preguntas.length === 0) return finish(ctx, { meal, at, preguntas, respuestas: [] }); // standard meal(s), skip straight to finish
+  const session = { meal, at, preguntas, respuestas: [], lastActivity: Date.now(), batch: esMultiple };
   sessions.set(ctx.chat.id, session);
-  const n = preguntas.length; // 0-3 now, not always 3
+  const n = preguntas.length; // 0-3 now, not always 3 (shared across all meals when batch)
   await ctx.reply(`🍽️ ${descripcion}\n\nTe hago ${n} pregunta${n > 1 ? 's' : ''} para afinar el cálculo (/cancelar para salir).`);
   await ctx.reply(question(session));
 }
