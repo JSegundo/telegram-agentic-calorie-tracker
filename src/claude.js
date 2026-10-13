@@ -1,5 +1,6 @@
 import Anthropic from '@anthropic-ai/sdk';
 import { getRecentMeals, getMealsInRange, updateMeal } from './sheets.js';
+import { log } from './log.js';
 
 const client = new Anthropic();
 
@@ -67,13 +68,18 @@ async function ask(content, schema, { tools, runTool } = {}) {
       ...(tools && { tools }),
       messages,
     });
+    log(`claude: stop=${res.stop_reason} in=${res.usage.input_tokens} out=${res.usage.output_tokens}`);
     if (res.stop_reason === 'tool_use') {
       // push full assistant content + answer all tool_use blocks in one message (parallel calls allowed)
       messages.push({ role: 'assistant', content: res.content });
       const results = await Promise.all(
         res.content
           .filter((b) => b.type === 'tool_use')
-          .map(async (b) => ({ type: 'tool_result', tool_use_id: b.id, content: JSON.stringify(await runTool(b.name, b.input)) })),
+          .map(async (b) => {
+            const result = await runTool(b.name, b.input);
+            log(`tool: ${b.name} input=${JSON.stringify(b.input)} -> ${Array.isArray(result) ? `${result.length} filas` : JSON.stringify(result)}`);
+            return { type: 'tool_result', tool_use_id: b.id, content: JSON.stringify(result) };
+          }),
       );
       messages.push({ role: 'user', content: results });
       continue;
@@ -152,7 +158,7 @@ Si sí es una sola comida nueva para registrar, poné es_consulta=false, es_mult
 - Si la hora no deja claro si es desayuno, almuerzo, merienda, cena o snack, sumá una pregunta para confirmarlo.
 - Si la comida es simple y estándar (ej. una banana, una manzana, un café con leche, un yogurt sin agregados) y podés estimar razonablemente sin arriesgar mucho el cálculo, no preguntes nada: dejá preguntas=[] y asumí cantidades estándar.
 No preguntes algo que ya es evidente en la foto o la descripción.
-Si el usuario pide "lo de siempre" o algo equivalente, usá buscar_comida_habitual para ver las cantidades habituales de ese tipo de comida y hacé la pregunta mostrando ese valor como default (ej. "¿Cuántas fetas de bacon? Lo usual: 2") en vez de preguntar en blanco. Si no hay historial, preguntá normalmente.`,
+Si el usuario pide "lo de siempre" o algo equivalente, usá buscar_comida_habitual para ver las cantidades habituales de ese tipo de comida y hacé la pregunta mostrando ese valor como default (ej. "¿Cuántas fetas de bacon? Lo usual: 2") en vez de preguntar en blanco. Si dice que es exactamente lo mismo que una comida registrada (ej. "lo mismo que ayer"), no preguntes nada (preguntas=[]). En ambos casos, en descripcion copiá la comida encontrada: fecha, descripción, kcal y proteína registradas — el paso siguiente solo ve tu descripcion, no el historial. Si no hay historial, preguntá normalmente.`,
       },
     ],
     QUESTIONS,
@@ -164,11 +170,11 @@ Si el usuario pide "lo de siempre" o algo equivalente, usá buscar_comida_habitu
 // Batch counterpart of calculateMeal: takes the original backfill text (not split up front —
 // Claude both re-identifies the individual meals and computes each one's totals here) plus
 // the up-to-3 shared answers, and returns one result per meal it finds.
-export async function calculateMeals(text, preguntas, respuestas, now) {
+export async function calculateMeals(text, analisis, preguntas, respuestas, now) {
   const qa = preguntas.map((q, i) => `P: ${q}\nR: ${respuestas[i]}`).join('\n\n');
   return ask(
     [
-      { type: 'text', text: `Comidas: ${text}` },
+      { type: 'text', text: `Comidas: ${text}\nAnálisis previo: ${analisis}` },
       {
         type: 'text',
         text: `${qa}
@@ -184,16 +190,19 @@ Si tiene sentido (o no hay preguntas/respuestas), poné valido=true y para cada 
   );
 }
 
-export async function calculateMeal(meal, preguntas, respuestas, now) {
+// analisis: analyzeMeal's descripcion — the only way history it looked up ("lo mismo que ayer") reaches this call.
+export async function calculateMeal(meal, analisis, preguntas, respuestas, now) {
   const qa = preguntas.map((q, i) => `P: ${q}\nR: ${respuestas[i]}`).join('\n\n');
   return ask(
     [
       ...mealContent(meal),
       {
         type: 'text',
-        text: `${qa}
+        text: `Análisis previo: ${analisis}
 
-Hora local: ${now}. Si no hay preguntas ni respuestas arriba, es porque ya decidiste que la comida era simple/estándar — calculá directamente con cantidades estándar razonables para lo que ves.
+${qa}
+
+Hora local: ${now}. Si el análisis previo incluye una comida registrada que el usuario dice repetir exactamente, usá esos mismos valores (descripción, kcal, proteína). Si no hay preguntas ni respuestas arriba, es porque ya decidiste que la comida era simple/estándar — calculá directamente con cantidades estándar razonables para lo que ves.
 Si alguna respuesta no tiene sentido para la pregunta que se hizo (no responde lo que se pidió, es contradictoria, es texto random), poné valido=false, descripcion con una frase breve explicando qué respuesta no se entendió, fecha igual a la fecha de hoy (la de "Hora local"), y dejá tipo="Snack", calorias=0, proteina=0, detalle="" (no se van a usar).
 Si las respuestas tienen sentido (o no hay ninguna), poné valido=true y calculá los totales:
 - fecha: la fecha real en que se comió esto, en formato YYYY-MM-DD. Si la foto, el texto o alguna respuesta menciona una referencia temporal (ej. "ayer", "anteayer", "el lunes pasado", una fecha concreta), calculala a partir de la fecha de hoy (la de "Hora local"). Si no menciona nada, usá la fecha de hoy tal cual.

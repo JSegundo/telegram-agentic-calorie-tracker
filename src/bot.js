@@ -3,17 +3,16 @@ import axios from 'axios';
 import { Telegraf } from 'telegraf';
 import { analyzeMeal, calculateMeal, calculateMeals } from './claude.js';
 import { appendMeal } from './sheets.js';
+import { log } from './log.js';
 
 const allowed = new Set(process.env.ALLOWED_USER_IDS.split(',').map((id) => id.trim()));
 // Claude calls can take a while; don't let Telegraf time the handler out mid-meal.
 const bot = new Telegraf(process.env.TELEGRAM_BOT_TOKEN, { handlerTimeout: Infinity });
 
-const log = (...args) => console.log(new Date().toISOString(), ...args);
-
 // weekday + ISO date + time: claude.js needs an unambiguous "today" to resolve "ayer"/"el lunes pasado".
 const localNow = (at) => `${at.toLocaleDateString('es-CR', { weekday: 'long' })} ${at.toLocaleDateString('en-CA')} ${at.toLocaleTimeString('es-CR')}`;
 
-// chatId -> { meal, at, preguntas, respuestas, lastActivity }
+// chatId -> { meal, analisis, at, preguntas, respuestas, lastActivity }
 const sessions = new Map();
 
 // sweeps sessions idle past SESSION_TIMEOUT_MS — otherwise an abandoned meal (unanswered
@@ -83,17 +82,17 @@ bot.on('text', async (ctx) => {
 });
 
 // shared by bot.on('text') and startMeal() (when preguntas=[] skips straight here)
-async function finishMeal(ctx, { meal, at, preguntas, respuestas }) {
+async function finishMeal(ctx, { meal, analisis, at, preguntas, respuestas }) {
   await ctx.sendChatAction('typing');
   let r;
   log(`calculateMeal: chat=${ctx.chat.id} start`);
   try {
-    r = await calculateMeal(meal, preguntas, respuestas, localNow(at));
+    r = await calculateMeal(meal, analisis, preguntas, respuestas, localNow(at));
   } catch (err) {
     respuestas.pop(); // nothing was saved: let the user resend the last answer to retry (no-op if there wasn't one)
     throw err;
   }
-  log(`calculateMeal: chat=${ctx.chat.id} done valido=${r.valido}`);
+  log(`calculateMeal: chat=${ctx.chat.id} done valido=${r.valido} descripcion=${JSON.stringify(r.descripcion)}`);
   // r.valido: nonsense answer rejected here (restarts) instead of writing a bogus row
   if (!r.valido) {
     sessions.delete(ctx.chat.id);
@@ -117,12 +116,12 @@ async function finishMeal(ctx, { meal, at, preguntas, respuestas }) {
 // Batch counterpart of finishMeal, for a day-backfill message ("ayer desayuné X, almorcé
 // Y, cené Z"). appendMeal runs in a loop here, so a failure partway through can re-save
 // rows that already succeeded on retry — acceptable for a personal single-user sheet.
-async function finishMeals(ctx, { meal, at, preguntas, respuestas }) {
+async function finishMeals(ctx, { meal, analisis, at, preguntas, respuestas }) {
   await ctx.sendChatAction('typing');
   let r;
   log(`calculateMeals: chat=${ctx.chat.id} start`);
   try {
-    r = await calculateMeals(meal.text, preguntas, respuestas, localNow(at));
+    r = await calculateMeals(meal.text, analisis, preguntas, respuestas, localNow(at));
   } catch (err) {
     respuestas.pop();
     throw err;
@@ -152,12 +151,12 @@ async function startMeal(ctx, meal) {
   await ctx.sendChatAction('typing');
   log(`analyzeMeal: chat=${ctx.chat.id} start`);
   const { descripcion, preguntas, valido, esConsulta, esMultiple } = await analyzeMeal(meal, localNow(at));
-  log(`analyzeMeal: chat=${ctx.chat.id} done valido=${valido} esConsulta=${esConsulta} esMultiple=${esMultiple}`);
+  log(`analyzeMeal: chat=${ctx.chat.id} done valido=${valido} esConsulta=${esConsulta} esMultiple=${esMultiple} preguntas=${preguntas.length} descripcion=${JSON.stringify(descripcion)}`);
   if (esConsulta) return ctx.reply(descripcion); // history query ("cómo estuvo ayer"), already answered — nothing to log
   if (!valido) return ctx.reply(descripcion); // junk input, nothing to ask
   const finish = esMultiple ? finishMeals : finishMeal;
-  if (preguntas.length === 0) return finish(ctx, { meal, at, preguntas, respuestas: [] }); // standard meal(s), skip straight to finish
-  const session = { meal, at, preguntas, respuestas: [], lastActivity: Date.now(), batch: esMultiple };
+  if (preguntas.length === 0) return finish(ctx, { meal, analisis: descripcion, at, preguntas, respuestas: [] }); // standard meal(s), skip straight to finish
+  const session = { meal, analisis: descripcion, at, preguntas, respuestas: [], lastActivity: Date.now(), batch: esMultiple };
   sessions.set(ctx.chat.id, session);
   const n = preguntas.length; // 0-3 now, not always 3 (shared across all meals when batch)
   await ctx.reply(`🍽️ ${descripcion}\n\nTe hago ${n} pregunta${n > 1 ? 's' : ''} para afinar el cálculo (/cancelar para salir).`);
