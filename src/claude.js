@@ -58,11 +58,11 @@ async function ask(content, schema, { tools, runTool } = {}) {
   const messages = [{ role: 'user', content }];
   for (;;) {
     const res = await client.beta.messages.create({
-      model: 'claude-opus-5-5',
+      model: 'claude-sonnet-5-5',
       max_tokens: 16000,
       betas: ['server-side-fallback-2026-07-01'],
       fallbacks: 'default',
-      output_config: { effort: 'high', format: { type: 'json_schema', schema } },
+      output_config: { effort: 'low', format: { type: 'json_schema', schema } },
       system: SYSTEM,
       ...(tools && { tools }),
       messages,
