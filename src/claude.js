@@ -1,5 +1,5 @@
 import Anthropic from '@anthropic-ai/sdk';
-import { getRecentMeals, getMealsInRange } from './sheets.js';
+import { getRecentMeals, getMealsInRange, updateMeal } from './sheets.js';
 
 const client = new Anthropic();
 
@@ -19,7 +19,8 @@ const object = (properties) => ({
 
 // preguntas: 0-3 contextual questions (bot.js reads .length for the "n/total" counter).
 // valido=false: non-food input, descripcion holds the rejection message, preguntas=[].
-// es_consulta=true: history query, descripcion holds the narrated answer; valido/preguntas are unused filler then.
+// es_consulta=true: history query or correction, already handled via tools; descripcion holds the reply,
+// valido/preguntas are unused filler then.
 // es_multiple=true: text describes 2+ meals in one message (a day backfill) — preguntas is
 // still 0-3 but shared across all of them, not per meal; bot.js routes to calculateMeals().
 const QUESTIONS = object({
@@ -100,11 +101,29 @@ const TOOLS = [
     description: 'Busca las comidas registradas entre dos fechas (inclusive) para responder preguntas sobre el historial, ej. "cómo estuvo ayer", "qué comí la semana pasada", "cuánta proteína llevo esta semana". Llamar cuando el texto es una pregunta sobre comidas pasadas, no una comida nueva para registrar. desde/hasta en formato YYYY-MM-DD, resueltos a partir de la Hora local (ej. "ayer" = ese único día; "la semana pasada" = lunes a domingo anterior).',
     input_schema: object({ desde: { type: 'string', format: 'date' }, hasta: { type: 'string', format: 'date' } }),
   },
+  {
+    name: 'corregir_comida',
+    description: 'Corrige una comida ya registrada, reemplazando fecha, tipo, descripción, calorías y proteína de esa fila. Llamar SOLO cuando el usuario pide corregir/cambiar una comida ya guardada, después de ubicarla con consultar_historial. fila y descripcion_actual: copiados exactos del resultado de consultar_historial. El resto: los valores finales completos (corregidos y recalculados), no solo lo que cambió.',
+    strict: true,
+    input_schema: object({
+      fila: int,
+      descripcion_actual: str,
+      fecha: { type: 'string', format: 'date' },
+      tipo: MEAL_FIELDS.tipo,
+      descripcion: str,
+      calorias: int,
+      proteina: int,
+    }),
+  },
 ];
 
 async function runTool(name, input) {
   if (name === 'buscar_comida_habitual') return getRecentMeals(input.tipo);
   if (name === 'consultar_historial') return getMealsInRange(input.desde, input.hasta);
+  if (name === 'corregir_comida') {
+    const { fila, descripcion_actual, fecha, tipo, descripcion, calorias, proteina } = input;
+    return updateMeal(fila, descripcion_actual, [fecha, tipo, descripcion, calorias, proteina]);
+  }
   throw new Error(`unknown tool ${name}`);
 }
 
@@ -123,6 +142,7 @@ export async function analyzeMeal(meal, now) {
       {
         type: 'text',
         text: `Hora local: ${now}. Si el texto es una pregunta sobre el historial de comidas (ej. "cómo estuvo ayer", "qué tal la semana pasada", "cuánta proteína llevo hoy") y no una comida nueva para registrar: poné es_consulta=true, valido=true, es_multiple=false, preguntas=[], usá consultar_historial con el rango de fechas correspondiente, y en descripcion escribí la respuesta completa en tono de nutricionista (breve, con los totales reales y algún comentario útil).
+Si el texto pide corregir una comida ya registrada (ej. "corregí el desayuno de hoy, eran 2 huevos no 3", "el almuerzo de ayer tenía 700 kcal"): poné es_consulta=true, valido=true, es_multiple=false, preguntas=[]; ubicá la fila con consultar_historial, recalculá los totales con la corrección y guardalos con corregir_comida. En descripcion contá qué cambiaste (antes → después, con kcal y proteína). Si no queda claro qué comida es o qué cambiar, no llames corregir_comida: en descripcion pedí que lo reenvíe en un solo mensaje con ese dato.
 Si el texto describe 2 o más comidas distintas en un mismo mensaje (ej. "ayer desayuné tostadas, almorcé pollo y cené ensalada", un repaso de todo un día): poné es_multiple=true, valido=true, es_consulta=false, descripcion con un resumen breve de las comidas que detectaste, y hacé hasta 3 preguntas EN TOTAL (0 a 3, no por comida) — solo las imprescindibles para calcular todas.
 Si la foto o el texto NO corresponden a una comida real ni a una consulta (objeto random, texto sin sentido, spam, etc.), poné es_consulta=false, es_multiple=false, valido=false, preguntas=[] y descripcion con una frase breve explicando por qué no se puede procesar.
 Si sí es una sola comida nueva para registrar, poné es_consulta=false, es_multiple=false, valido=true, describí brevemente lo que ves, clasificá la comida y hacé hasta 3 preguntas (0 a 3), solo las necesarias para reducir la incertidumbre del cálculo:

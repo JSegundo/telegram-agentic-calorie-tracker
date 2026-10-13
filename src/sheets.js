@@ -47,9 +47,25 @@ export async function getRecentMeals(tipo, limit = 8) {
 }
 
 // backs claude.js's consultar_historial; desde/hasta are YYYY-MM-DD, inclusive.
+// fila = sheet row number (1-based), what corregir_comida targets.
 export async function getMealsInRange(desde, hasta) {
   const rows = await getRows();
   return rows
-    .filter(([fecha]) => fecha >= desde && fecha <= hasta)
-    .map(([fecha, tipo, descripcion, calorias, proteina]) => ({ fecha, tipo, descripcion, calorias, proteina }));
+    .map(([fecha, tipo, descripcion, calorias, proteina], i) => ({ fila: i + 1, fecha, tipo, descripcion, calorias, proteina }))
+    .filter(({ fecha }) => fecha >= desde && fecha <= hasta);
+}
+
+// backs claude.js's corregir_comida. Overwrites Fecha..Proteína (A:E) and keeps Notas.
+// descripcionActual must still match the row: if it was deleted/moved by hand since
+// consultar_historial read it, refuse instead of overwriting a different meal.
+export async function updateMeal(fila, descripcionActual, [fecha, tipo, descripcion, calorias, proteina]) {
+  const rows = await getRows();
+  if (fila < 2 || rows[fila - 1]?.[2] !== descripcionActual) return { error: 'La fila cambió o no existe. Volvé a consultar_historial.' };
+  await sheets.spreadsheets.values.update({
+    spreadsheetId: process.env.SPREADSHEET_ID,
+    range: `'${process.env.SHEET_NAME}'!A${fila}:E${fila}`,
+    valueInputOption: 'USER_ENTERED',
+    requestBody: { values: [[fecha, tipo, descripcion, calorias, proteina]] },
+  });
+  return { ok: true };
 }
