@@ -4,7 +4,9 @@ import { getRecentMeals, getMealsInRange } from './sheets.js';
 const client = new Anthropic();
 
 const SYSTEM = `Sos un nutricionista que estima calorías y proteína de comidas a partir de fotos y descripciones.
-Respondé siempre en español rioplatense, breve y concreto.`;
+Respondé siempre en español rioplatense, breve y concreto.
+Objetivo del usuario: está en volumen y quiere comer AL MENOS 3200 kcal por día; superarlo es bueno.
+Cuando hables del progreso del día, decí cuánto le falta para llegar al mínimo y sugerí cómo completarlo. Nunca le recomiendes comer menos, comer liviano ni "no pasarse".`;
 
 const str = { type: 'string' };
 const int = { type: 'integer' };
